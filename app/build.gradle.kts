@@ -6,15 +6,15 @@ plugins {
 android {
     namespace = "com.example.liveclip"
     compileSdk {
-        version = release(36) {
+        version = release(37) {
             minorApiLevel = 1
         }
     }
 
     defaultConfig {
         applicationId = "com.example.liveclip"
-        minSdk = 24
-        targetSdk = 36
+        minSdk = 34
+        targetSdk = 37
         versionCode = 1
         versionName = "1.0"
 
