@@ -25,6 +25,7 @@ import android.util.Log
 import android.view.Surface
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
+import android.media.MediaCodecInfo
 import java.io.File
 
 class RecordingService : Service() {
@@ -177,7 +178,22 @@ class RecordingService : Service() {
                         MediaFormat.MIMETYPE_VIDEO_AVC,
                         width,
                         height
-                    )
+                    ).apply {
+                        // 입력을 ByteBuffer 대신 Surface로 받음
+                        setInteger(
+                            MediaFormat.KEY_COLOR_FORMAT,
+                            MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+                        )
+
+                        // 목표 비트레이트: 초당 8,000,000비트
+                        setInteger(MediaFormat.KEY_BIT_RATE, 8_000_000)
+
+                        // 인코더가 예상하는 초당 프레임 수
+                        setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+
+                        // 키 프레임 간격: 약 1초
+                        setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                    }
 
                     mediaCodec?.apply {
                         configure(
