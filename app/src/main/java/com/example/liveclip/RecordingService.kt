@@ -9,6 +9,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.MediaCodec
+import android.media.MediaFormat
 import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -20,6 +22,7 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.util.Log
+import android.view.Surface
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import java.io.File
@@ -28,6 +31,8 @@ class RecordingService : Service() {
     private var mediaRecorder: MediaRecorder? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var mediaProjection: MediaProjection? = null
+    private var mediaCodec: MediaCodec? = null
+    private var inputSurface: Surface? = null
 
     private var isRecording = false
     private var isStopping = false
@@ -76,36 +81,43 @@ class RecordingService : Service() {
             }
 
             else -> {
-                val notification = NotificationCompat.Builder(
-                    this,
-                    CHANNEL_ID
-                )
-                    .setContentTitle("LiveClip")
-                    .setContentText("화면 녹화 서비스가 실행 중입니다.")
-                    .setSmallIcon(R.mipmap.ic_launcher)
-                    .setOngoing(true)
-                    .build()
+                if (isRecording || isStopping) return START_NOT_STICKY
 
-                // Foreground Service로 전환
-                startForeground(
-                    NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                )
+                try {
+                    val notification = NotificationCompat.Builder(
+                        this,
+                        CHANNEL_ID
+                    )
+                        .setContentTitle("LiveClip")
+                        .setContentText("화면 녹화 서비스가 실행 중입니다.")
+                        .setSmallIcon(R.mipmap.ic_launcher)
+                        .setOngoing(true)
+                        .build()
 
-                // 다음 단계:
-                // intent에서 resultCode, resultData를 꺼내
-                // MediaProjection 객체 생성
-                val resultCode = intent?.getIntExtra(
-                    "resultCode",
-                    Activity.RESULT_CANCELED
-                )
+                    // 다음 단계:
+                    // intent에서 resultCode, resultData를 꺼내
+                    // MediaProjection 객체 생성
+                    val resultCode = intent?.getIntExtra(
+                        "resultCode",
+                        Activity.RESULT_CANCELED
+                    )
 
-                // intent는 Parcelable로 구현되어있음
-                val resultData =
-                    intent?.getParcelableExtra("resultData", Intent::class.java)
+                    // intent는 Parcelable로 구현되어있음
+                    val resultData =
+                        intent?.getParcelableExtra("resultData", Intent::class.java)
 
-                if (resultCode == Activity.RESULT_OK && resultData != null) {
+                    if (resultCode != Activity.RESULT_OK || resultData == null) {
+                        Log.w("RecordingService", "화면 캡처 승인 데이터가 없어 서비스를 종료합니다")
+                        stopRecording()
+                        return START_NOT_STICKY
+                    }
+
+                    // Foreground Service로 전환
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                    )
 
                     val mediaProjectionManager =
                         getSystemService(MediaProjectionManager::class.java)
@@ -147,8 +159,6 @@ class RecordingService : Service() {
                     val height = bounds.height()
                     val densityDpi = resources.configuration.densityDpi
 
-                    mediaRecorder = MediaRecorder(this)
-
                     // 1. MediaStore에 저장할 파일 생성
                     val uri = createVideoUri()
                     videoUri = uri
@@ -159,25 +169,49 @@ class RecordingService : Service() {
 
                     outputPfd = pfd
 
-                    mediaRecorder?.apply {
-                        setVideoSource(MediaRecorder.VideoSource.SURFACE)
-                        setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                    mediaCodec = MediaCodec.createEncoderByType(
+                        MediaFormat.MIMETYPE_VIDEO_AVC
+                    )
 
-                        setVideoEncoder(MediaRecorder.VideoEncoder.H264) // 압축 방식 설정
-                        setVideoSize(width, height)
-                        setVideoFrameRate(30) //30fps
-                        setVideoEncodingBitRate(8_000_000) // 1초 동안 인코딩된 영상에 사용하는 데이터량 = 8Mbps
+                    val format = MediaFormat.createVideoFormat(
+                        MediaFormat.MIMETYPE_VIDEO_AVC,
+                        width,
+                        height
+                    )
 
-                        setOutputFile(pfd.fileDescriptor)
-
-                        prepare()
+                    mediaCodec?.apply {
+                        configure(
+                            format,
+                            null,
+                            null,
+                            MediaCodec.CONFIGURE_FLAG_ENCODE
+                        )
                     }
+
+                    // ⬆️----------------mediaCodec----------------------
+
+//                    mediaRecorder = MediaRecorder(this)
+//
+//                    mediaRecorder?.apply {
+//                        setVideoSource(MediaRecorder.VideoSource.SURFACE)
+//                        setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+//
+//                        setVideoEncoder(MediaRecorder.VideoEncoder.H264) // 압축 방식 설정
+//                        setVideoSize(width, height)
+//                        setVideoFrameRate(30) //30fps
+//                        setVideoEncodingBitRate(8_000_000) // 1초 동안 인코딩된 영상에 사용하는 데이터량 = 8Mbps
+//
+//                        setOutputFile(pfd.fileDescriptor)
+//
+//                        prepare()
+//                    }
 
                     // TODO: surface를 mediaRecoder에서 얻는 것이 아니라,
                     // mediaCodec에서 얻어야 한다.
                     // 나는 지금 전체 mp4 파일이 아니라 1초 마다 frame 정보를 가지고 있다가
                     // 그 정보로 mp4 파일을 만들어야 함.
-                    val surface = mediaRecorder?.surface
+                    val surface = mediaCodec?.createInputSurface() //mediaRecorder?.surface
+                    inputSurface = surface
 
                     virtualDisplay = mediaProjection?.createVirtualDisplay(
                         "LiveClip",
@@ -190,8 +224,13 @@ class RecordingService : Service() {
                         null
                     )
 
-                    mediaRecorder?.start()
+                    //mediaRecorder?.start()
+                    mediaCodec?.start()
                     isRecording = true
+
+                } catch (e: Exception) {
+                    Log.e("RecordingService", "녹화 초기화 실패", e)
+                    stopRecording()
                 }
             }
         }
@@ -226,7 +265,32 @@ class RecordingService : Service() {
             isRecording = false
         }
 
-        // 2. 파일 디스크립터 닫기
+        // 2. VirtualDisplay 및 인코더 해제
+        try {
+            virtualDisplay?.release()
+        } catch (e: Exception) {
+            Log.e("RecordingService", "VirtualDisplay 해제 실패", e)
+        }
+        virtualDisplay = null
+
+        // configure/start 도중 실패한 코덱도 release로 해제합니다.
+        val codec = mediaCodec
+        mediaCodec = null
+        try {
+            codec?.release()
+        } catch (e: Exception) {
+            Log.e("RecordingService", "MediaCodec 해제 실패", e)
+        }
+
+        val surface = inputSurface
+        inputSurface = null
+        try {
+            surface?.release()
+        } catch (e: Exception) {
+            Log.e("RecordingService", "입력 Surface 해제 실패", e)
+        }
+
+        // 3. 파일 디스크립터 닫기
         try {
             outputPfd?.close()
         } catch (e: Exception) {
@@ -234,7 +298,7 @@ class RecordingService : Service() {
         }
         outputPfd = null
 
-        // 3. MediaStore에서 영상 공개 또는 삭제
+        // 4. MediaStore에서 영상 공개 또는 삭제
         videoUri?.let { uri ->
             try {
                 if (savedSuccessfully) {
@@ -263,14 +327,6 @@ class RecordingService : Service() {
         }
         videoUri = null
 
-        // 4. VirtualDisplay 해제
-        try {
-            virtualDisplay?.release()
-        } catch (e: Exception) {
-            Log.e("RecordingService", "VirtualDisplay 해제 실패", e)
-        }
-        virtualDisplay = null
-
         // 5. MediaProjection 종료
         val projection = mediaProjection
         mediaProjection = null
@@ -281,8 +337,14 @@ class RecordingService : Service() {
             Log.e("RecordingService", "MediaProjection 종료 실패", e)
         }
 
-        // 6. Service 종료
-        stopSelf()
+        // 6. 알림 제거 및 Service 종료
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } catch (e: Exception) {
+            Log.e("RecordingService", "Foreground 종료 실패", e)
+        } finally {
+            stopSelf()
+        }
     }
 
 
