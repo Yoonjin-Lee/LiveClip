@@ -163,16 +163,20 @@ class RecordingService : Service() {
                         setVideoSource(MediaRecorder.VideoSource.SURFACE)
                         setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
 
-                        setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                        setVideoEncoder(MediaRecorder.VideoEncoder.H264) // 압축 방식 설정
                         setVideoSize(width, height)
-                        setVideoFrameRate(30)
-                        setVideoEncodingBitRate(8_000_000)
+                        setVideoFrameRate(30) //30fps
+                        setVideoEncodingBitRate(8_000_000) // 1초 동안 인코딩된 영상에 사용하는 데이터량 = 8Mbps
 
                         setOutputFile(pfd.fileDescriptor)
 
                         prepare()
                     }
 
+                    // TODO: surface를 mediaRecoder에서 얻는 것이 아니라,
+                    // mediaCodec에서 얻어야 한다.
+                    // 나는 지금 전체 mp4 파일이 아니라 1초 마다 frame 정보를 가지고 있다가
+                    // 그 정보로 mp4 파일을 만들어야 함.
                     val surface = mediaRecorder?.surface
 
                     virtualDisplay = mediaProjection?.createVirtualDisplay(
