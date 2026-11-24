@@ -26,10 +26,15 @@ import android.view.Surface
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import android.media.MediaCodecInfo
-import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import java.nio.ByteBuffer
 
 class RecordingService : Service() {
-    private var mediaRecorder: MediaRecorder? = null
+    //private var mediaRecorder: MediaRecorder? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var mediaProjection: MediaProjection? = null
     private var mediaCodec: MediaCodec? = null
@@ -39,12 +44,17 @@ class RecordingService : Service() {
     private var isStopping = false
     private var videoUri: Uri? = null
     private var outputPfd: ParcelFileDescriptor? = null
+    private var rollingBuffer: MutableList<BufferData> = mutableListOf()
 
     companion object {
         private const val CHANNEL_ID = "recording_channel"
         private const val NOTIFICATION_ID = 1
         const val ACTION_STOP = "com.example.liveclip.STOP"
     }
+
+    private val serviceScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO
+    )
 
     override fun onCreate() {
         super.onCreate()
@@ -244,6 +254,48 @@ class RecordingService : Service() {
                     mediaCodec?.start()
                     isRecording = true
 
+                    // TODO: 1. outputBuffer를 꺼내서 log 찍기
+                    serviceScope.launch  {
+                        while (mediaCodec != null && isRecording) {
+                            val bufferInfo = MediaCodec.BufferInfo()
+
+                            val outputBufferId = mediaCodec?.dequeueOutputBuffer(
+                                bufferInfo,
+                                10_000L //10ms, 사용 가능한 버퍼가 없을 때 얼마나 기다릴 것인지
+                            )
+
+                            if (outputBufferId != null && outputBufferId >= 0) { // 읽을 버퍼가 있는 경우
+                                val outputBuffer = mediaCodec?.getOutputBuffer(outputBufferId)
+
+                                //Log.d("recording", "outputBufferId: $outputBufferId")
+
+                                val copiedBuffer = ByteBuffer.allocate(bufferInfo.size)
+                                copiedBuffer.put(outputBuffer)
+                                copiedBuffer.flip() // 읽을 수 있는 상태로 전환
+
+                                val copiedBufferInfo = MediaCodec.BufferInfo().apply {
+                                    set(
+                                        0,
+                                        bufferInfo.size,
+                                        bufferInfo.presentationTimeUs,
+                                        bufferInfo.flags
+                                    )
+                                }
+
+                                rollingBuffer.add(
+                                    BufferData(
+                                        buffer = copiedBuffer,
+                                        bufferInfo = copiedBufferInfo
+                                    )
+                                )
+
+                                mediaCodec?.releaseOutputBuffer(outputBufferId, false)
+
+                                Log.d("recording", "rolling buffer size: ${rollingBuffer.size}")
+                            }
+                        }
+                    }
+
                 } catch (e: Exception) {
                     Log.e("RecordingService", "녹화 초기화 실패", e)
                     stopRecording()
@@ -260,9 +312,9 @@ class RecordingService : Service() {
 
         var savedSuccessfully = false
 
-        // 1. MediaRecorder 종료
+        // 1. MediaCodec 종료
         try {
-            mediaRecorder?.let { recorder ->
+            mediaCodec?.let { recorder ->
                 if (isRecording) {
                     recorder.stop()
                     savedSuccessfully = true
@@ -273,13 +325,17 @@ class RecordingService : Service() {
             Log.e("RecordingService", "녹화 파일 저장 실패", e)
         } finally {
             try {
-                mediaRecorder?.release()
+                mediaCodec?.release()
             } catch (e: Exception) {
-                Log.e("RecordingService", "Recorder 해제 실패", e)
+                Log.e("RecordingService", "Codec 해제 실패", e)
             }
-            mediaRecorder = null
+            mediaCodec = null
             isRecording = false
         }
+
+        // TODO: mediaMuxer에 버퍼 전달
+
+
 
         // 2. VirtualDisplay 및 인코더 해제
         try {
@@ -289,14 +345,6 @@ class RecordingService : Service() {
         }
         virtualDisplay = null
 
-        // configure/start 도중 실패한 코덱도 release로 해제합니다.
-        val codec = mediaCodec
-        mediaCodec = null
-        try {
-            codec?.release()
-        } catch (e: Exception) {
-            Log.e("RecordingService", "MediaCodec 해제 실패", e)
-        }
 
         val surface = inputSurface
         inputSurface = null
