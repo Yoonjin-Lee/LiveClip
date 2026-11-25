@@ -11,7 +11,7 @@ import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaFormat
-import android.media.MediaRecorder
+import android.media.MediaMuxer
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
@@ -20,6 +20,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.view.Surface
@@ -29,19 +30,21 @@ import android.media.MediaCodecInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.nio.ByteBuffer
 
 class RecordingService : Service() {
-    //private var mediaRecorder: MediaRecorder? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var mediaProjection: MediaProjection? = null
     private var mediaCodec: MediaCodec? = null
     private var inputSurface: Surface? = null
 
     private var isRecording = false
-    private var isStopping = false
+    @Volatile private var isStopping = false
+    private var drainJob: Job? = null
+    private var outputFormat: MediaFormat? = null
+    private var drainFailed = false
     private var videoUri: Uri? = null
     private var outputPfd: ParcelFileDescriptor? = null
     private var rollingBuffer: MutableList<BufferData> = mutableListOf()
@@ -82,10 +85,6 @@ class RecordingService : Service() {
         flags: Int,
         startId: Int
     ): Int {
-        // 여기서 Foreground Service 시작 및
-        // MediaProjection 관련 작업 처리
-        // 사용자에게 표시할 알림 생성
-
         when (intent?.action) {
             ACTION_STOP -> {
                 stopRecording()
@@ -105,9 +104,7 @@ class RecordingService : Service() {
                         .setOngoing(true)
                         .build()
 
-                    // 다음 단계:
-                    // intent에서 resultCode, resultData를 꺼내
-                    // MediaProjection 객체 생성
+                    // Activity에서 전달한 화면 캡처 승인 결과를 확인합니다.
                     val resultCode = intent?.getIntExtra(
                         "resultCode",
                         Activity.RESULT_CANCELED
@@ -146,23 +143,6 @@ class RecordingService : Service() {
                         },
                         Handler(Looper.getMainLooper())
                     )
-
-                    /**
-                     * 기기 화면 정보 조회
-                     * width / height / densityDpi
-                     *
-                     * MediaRecorder 설정
-                     * 해상도, 코덱, 파일 경로 설정 후 prepare()
-                     *
-                     * Surface 획득
-                     * mediaRecorder.surface
-                     *
-                     * VirtualDisplay 생성
-                     * Surface를 출력 대상으로 연결
-                     *
-                     * MediaRecorder.start()
-                     * 화면 프레임 인코딩 및 파일 기록 시작
-                     */
 
                     val windowManager = getSystemService(WindowManager::class.java)
                     val bounds = windowManager.maximumWindowMetrics.bounds
@@ -214,29 +194,7 @@ class RecordingService : Service() {
                         )
                     }
 
-                    // ⬆️----------------mediaCodec----------------------
-
-//                    mediaRecorder = MediaRecorder(this)
-//
-//                    mediaRecorder?.apply {
-//                        setVideoSource(MediaRecorder.VideoSource.SURFACE)
-//                        setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-//
-//                        setVideoEncoder(MediaRecorder.VideoEncoder.H264) // 압축 방식 설정
-//                        setVideoSize(width, height)
-//                        setVideoFrameRate(30) //30fps
-//                        setVideoEncodingBitRate(8_000_000) // 1초 동안 인코딩된 영상에 사용하는 데이터량 = 8Mbps
-//
-//                        setOutputFile(pfd.fileDescriptor)
-//
-//                        prepare()
-//                    }
-
-                    // TODO: surface를 mediaRecoder에서 얻는 것이 아니라,
-                    // mediaCodec에서 얻어야 한다.
-                    // 나는 지금 전체 mp4 파일이 아니라 1초 마다 frame 정보를 가지고 있다가
-                    // 그 정보로 mp4 파일을 만들어야 함.
-                    val surface = mediaCodec?.createInputSurface() //mediaRecorder?.surface
+                    val surface = mediaCodec?.createInputSurface()
                     inputSurface = surface
 
                     virtualDisplay = mediaProjection?.createVirtualDisplay(
@@ -250,49 +208,17 @@ class RecordingService : Service() {
                         null
                     )
 
-                    //mediaRecorder?.start()
                     mediaCodec?.start()
                     isRecording = true
 
-                    // TODO: 1. outputBuffer를 꺼내서 log 찍기
-                    serviceScope.launch  {
-                        while (mediaCodec != null && isRecording) {
-                            val bufferInfo = MediaCodec.BufferInfo()
-
-                            val outputBufferId = mediaCodec?.dequeueOutputBuffer(
-                                bufferInfo,
-                                10_000L //10ms, 사용 가능한 버퍼가 없을 때 얼마나 기다릴 것인지
-                            )
-
-                            if (outputBufferId != null && outputBufferId >= 0) { // 읽을 버퍼가 있는 경우
-                                val outputBuffer = mediaCodec?.getOutputBuffer(outputBufferId)
-
-                                //Log.d("recording", "outputBufferId: $outputBufferId")
-
-                                val copiedBuffer = ByteBuffer.allocate(bufferInfo.size)
-                                copiedBuffer.put(outputBuffer)
-                                copiedBuffer.flip() // 읽을 수 있는 상태로 전환
-
-                                val copiedBufferInfo = MediaCodec.BufferInfo().apply {
-                                    set(
-                                        0,
-                                        bufferInfo.size,
-                                        bufferInfo.presentationTimeUs,
-                                        bufferInfo.flags
-                                    )
-                                }
-
-                                rollingBuffer.add(
-                                    BufferData(
-                                        buffer = copiedBuffer,
-                                        bufferInfo = copiedBufferInfo
-                                    )
-                                )
-
-                                mediaCodec?.releaseOutputBuffer(outputBufferId, false)
-
-                                Log.d("recording", "rolling buffer size: ${rollingBuffer.size}")
-                            }
+                    val codec = checkNotNull(mediaCodec)
+                    drainJob = serviceScope.launch {
+                        try {
+                            collectEncodedBuffers(codec)
+                        } catch (e: Exception) {
+                            drainFailed = true
+                            Log.e("RecordingService", "인코더 출력 처리 실패", e)
+                            Handler(Looper.getMainLooper()).post { stopRecording() }
                         }
                     }
 
@@ -306,38 +232,95 @@ class RecordingService : Service() {
     }
 
 
+    // 녹화 중에는 이 함수만 버퍼 목록에 씁니다. 종료 시 join 후 읽고 비웁니다.
+    private fun collectEncodedBuffers(codec: MediaCodec) {
+        val info = MediaCodec.BufferInfo()
+        var eosSent = false
+        var eosDeadline = Long.MAX_VALUE
+
+        while (true) {
+            if (isStopping && !eosSent) {
+                codec.signalEndOfInputStream()
+                eosSent = true
+                eosDeadline = SystemClock.elapsedRealtime() + 5_000L
+            }
+            check(SystemClock.elapsedRealtime() < eosDeadline) {
+                "인코더 종료 출력을 기다리는 시간이 초과되었습니다"
+            }
+
+            when (val index = codec.dequeueOutputBuffer(info, 10_000L)) {
+                MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    // 입력 format 대신 SPS/PPS 등이 포함된 실제 출력 format을 저장합니다.
+                    outputFormat = codec.outputFormat
+                }
+                MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+                else -> if (index >= 0) {
+                    val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                    val isEnd = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                    try {
+                        if (!isConfig && info.size > 0) {
+                            val output = checkNotNull(codec.getOutputBuffer(index))
+                            output.position(info.offset)
+                            output.limit(info.offset + info.size)
+                            val copy = ByteBuffer.allocateDirect(info.size)
+                            copy.put(output)
+                            copy.flip()
+                            val copiedInfo = MediaCodec.BufferInfo().apply {
+                                set(0, info.size, info.presentationTimeUs, info.flags)
+                            }
+                            rollingBuffer.add(BufferData(copy, copiedInfo))
+                        }
+                    } finally {
+                        codec.releaseOutputBuffer(index, false)
+                    }
+                    if (isEnd) return
+                }
+            }
+        }
+    }
+
+    // 출력 수집이 끝난 뒤 호출하므로 버퍼 목록이 변경되지 않습니다.
+    private fun saveBufferedVideo() {
+        val format = checkNotNull(outputFormat) { "인코더 출력 포맷이 없습니다" }
+        val pfd = checkNotNull(outputPfd) { "저장할 파일이 열려 있지 않습니다" }
+        val firstKeyFrame = rollingBuffer.indexOfFirst {
+            (it.bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+        }
+        check(firstKeyFrame >= 0) { "저장할 키 프레임이 없습니다" }
+        val baseTimeUs = rollingBuffer[firstKeyFrame].bufferInfo.presentationTimeUs
+
+        val muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        try {
+            val trackIndex = muxer.addTrack(format)
+            muxer.start()
+            for (index in firstKeyFrame until rollingBuffer.size) {
+                val sample = rollingBuffer[index]
+                val info = MediaCodec.BufferInfo().apply {
+                    set(
+                        0,
+                        sample.bufferInfo.size,
+                        sample.bufferInfo.presentationTimeUs - baseTimeUs,
+                        sample.bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM.inv()
+                    )
+                }
+                val data = sample.buffer.duplicate()
+                data.position(0)
+                data.limit(info.size)
+                muxer.writeSampleData(trackIndex, data, info)
+            }
+            // stop()이 성공해야 MP4가 완성된 것으로 판단합니다.
+            muxer.stop()
+            Log.d("RecordingService", "MP4 저장 완료: ${rollingBuffer.size - firstKeyFrame}개 샘플")
+        } finally {
+            muxer.release()
+        }
+    }
+
     private fun stopRecording() {
         if (isStopping) return
         isStopping = true
 
-        var savedSuccessfully = false
-
-        // 1. MediaCodec 종료
-        try {
-            mediaCodec?.let { recorder ->
-                if (isRecording) {
-                    recorder.stop()
-                    savedSuccessfully = true
-                    Log.d("RecordingService", "녹화 종료 성공")
-                }
-            }
-        } catch (e: RuntimeException) {
-            Log.e("RecordingService", "녹화 파일 저장 실패", e)
-        } finally {
-            try {
-                mediaCodec?.release()
-            } catch (e: Exception) {
-                Log.e("RecordingService", "Codec 해제 실패", e)
-            }
-            mediaCodec = null
-            isRecording = false
-        }
-
-        // TODO: mediaMuxer에 버퍼 전달
-
-
-
-        // 2. VirtualDisplay 및 인코더 해제
+        // Surface에 새 프레임이 들어오는 것을 중단합니다.
         try {
             virtualDisplay?.release()
         } catch (e: Exception) {
@@ -346,68 +329,98 @@ class RecordingService : Service() {
         virtualDisplay = null
 
 
-        val surface = inputSurface
-        inputSurface = null
-        try {
-            surface?.release()
-        } catch (e: Exception) {
-            Log.e("RecordingService", "입력 Surface 해제 실패", e)
-        }
-
-        // 3. 파일 디스크립터 닫기
-        try {
-            outputPfd?.close()
-        } catch (e: Exception) {
-            Log.e("RecordingService", "파일 닫기 실패", e)
-        }
-        outputPfd = null
-
-        // 4. MediaStore에서 영상 공개 또는 삭제
-        videoUri?.let { uri ->
+        serviceScope.launch {
+            // 코덱 해제와 dequeueOutputBuffer가 동시에 실행되지 않도록 기다립니다.
+            drainJob?.join()
+            drainJob = null
+            var savedSuccessfully = false
             try {
-                if (savedSuccessfully) {
-                    val values = ContentValues().apply {
-                        put(MediaStore.Video.Media.IS_PENDING, 0)
-                    }
-
-                    val updatedRows = contentResolver.update(
-                        uri,
-                        values,
-                        null,
-                        null
-                    )
-
-                    Log.d(
-                        "RecordingService",
-                        "갤러리 공개 결과: $updatedRows, uri=$uri"
-                    )
-                } else {
-                    contentResolver.delete(uri, null, null)
-                    Log.w("RecordingService", "실패한 녹화 파일 삭제")
+                if (isRecording && !drainFailed) {
+                    saveBufferedVideo()
+                    savedSuccessfully = true
                 }
             } catch (e: Exception) {
-                Log.e("RecordingService", "MediaStore 처리 실패", e)
+                Log.e("RecordingService", "MP4 저장 실패", e)
+            } finally {
+                try {
+                    if (isRecording) mediaCodec?.stop()
+                } catch (e: Exception) {
+                    Log.e("RecordingService", "Codec 종료 실패", e)
+                }
+                try {
+                    mediaCodec?.release()
+                } catch (e: Exception) {
+                    Log.e("RecordingService", "Codec 해제 실패", e)
+                }
+                mediaCodec = null
+                isRecording = false
+                rollingBuffer.clear()
+                outputFormat = null
             }
-        }
-        videoUri = null
 
-        // 5. MediaProjection 종료
-        val projection = mediaProjection
-        mediaProjection = null
+            val surface = inputSurface
+            inputSurface = null
+            try {
+                surface?.release()
+            } catch (e: Exception) {
+                Log.e("RecordingService", "입력 Surface 해제 실패", e)
+            }
 
-        try {
-            projection?.stop()
-        } catch (e: Exception) {
-            Log.e("RecordingService", "MediaProjection 종료 실패", e)
-        }
+            // 3. 파일 디스크립터 닫기
+            try {
+                outputPfd?.close()
+            } catch (e: Exception) {
+                Log.e("RecordingService", "파일 닫기 실패", e)
+            }
+            outputPfd = null
 
-        // 6. 알림 제거 및 Service 종료
-        try {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } catch (e: Exception) {
-            Log.e("RecordingService", "Foreground 종료 실패", e)
-        } finally {
-            stopSelf()
+            // 4. MediaStore에서 영상 공개 또는 삭제
+            videoUri?.let { uri ->
+                try {
+                    if (savedSuccessfully) {
+                        val values = ContentValues().apply {
+                            put(MediaStore.Video.Media.IS_PENDING, 0)
+                        }
+
+                        val updatedRows = contentResolver.update(
+                            uri,
+                            values,
+                            null,
+                            null
+                        )
+
+                        Log.d(
+                            "RecordingService",
+                            "갤러리 공개 결과: $updatedRows, uri=$uri"
+                        )
+                    } else {
+                        contentResolver.delete(uri, null, null)
+                        Log.w("RecordingService", "실패한 녹화 파일 삭제")
+                    }
+                } catch (e: Exception) {
+                    Log.e("RecordingService", "MediaStore 처리 실패", e)
+                }
+            }
+            videoUri = null
+
+            // 5. MediaProjection 종료
+            val projection = mediaProjection
+            mediaProjection = null
+
+            try {
+                projection?.stop()
+            } catch (e: Exception) {
+                Log.e("RecordingService", "MediaProjection 종료 실패", e)
+            }
+
+            // 6. 알림 제거 및 Service 종료
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (e: Exception) {
+                Log.e("RecordingService", "Foreground 종료 실패", e)
+            } finally {
+                stopSelf()
+            }
         }
     }
 
