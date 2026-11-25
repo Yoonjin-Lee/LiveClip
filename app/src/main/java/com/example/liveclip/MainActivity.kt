@@ -1,10 +1,10 @@
 
 package com.example.liveclip
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.app.Activity.RESULT_OK
-import android.content.Context
 import android.content.Intent
-import android.media.MediaRecorder
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.util.Log
@@ -70,6 +70,30 @@ class MainActivity : ComponentActivity() {
     }
 
 
+    private val requestAudioPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            requestScreenCapture()
+        } else {
+            Toast.makeText(this, "내부 소리 녹화를 위해 오디오 권한이 필요합니다.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun requestScreenCapture() {
+        startMediaProjection.launch(mediaProjectionManager.createScreenCaptureIntent())
+    }
+
+    private fun startRecordingWithAudio() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED) {
+            requestScreenCapture()
+        } else {
+            requestAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -79,9 +103,7 @@ class MainActivity : ComponentActivity() {
             LiveClipTheme {
                 HomeScreen(
                     onClickStart = {
-                        startMediaProjection.launch(
-                            mediaProjectionManager.createScreenCaptureIntent()
-                        )
+                        startRecordingWithAudio()
                     },
                     onClickStop = {
                         val intent = Intent(

@@ -32,6 +32,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.cancel
 import java.nio.ByteBuffer
 
 class RecordingService : Service() {
@@ -43,8 +44,10 @@ class RecordingService : Service() {
     private var isRecording = false
     @Volatile private var isStopping = false
     private var drainJob: Job? = null
+    private var audioJob: Job? = null
+    private var audioRecorder: PlaybackAudioRecorder? = null
     private var outputFormat: MediaFormat? = null
-    private var drainFailed = false
+    @Volatile private var drainFailed = false
     private var videoUri: Uri? = null
     private var outputPfd: ParcelFileDescriptor? = null
     private var rollingBuffer: MutableList<BufferData> = mutableListOf()
@@ -74,6 +77,12 @@ class RecordingService : Service() {
         )
 
         manager.createNotificationChannel(channel)
+    }
+
+    override fun onDestroy() {
+        // 시스템이 서비스를 종료할 때도 캡처/코덱을 남기지 않습니다.
+        stopRecording()
+        super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? {
@@ -211,6 +220,19 @@ class RecordingService : Service() {
                     mediaCodec?.start()
                     isRecording = true
 
+                    val audio = PlaybackAudioRecorder()
+                    audioRecorder = audio // start 도중 실패해도 정리할 수 있도록 먼저 보관
+                    audio.start(this, checkNotNull(mediaProjection))
+                    audioJob = serviceScope.launch {
+                        try {
+                            audio.collect { isStopping }
+                        } catch (e: Exception) {
+                            drainFailed = true
+                            Log.e("RecordingService", "내부 오디오 처리 실패", e)
+                            Handler(Looper.getMainLooper()).post { stopRecording() }
+                        }
+                    }
+
                     val codec = checkNotNull(mediaCodec)
                     drainJob = serviceScope.launch {
                         try {
@@ -270,12 +292,7 @@ class RecordingService : Service() {
                             }
                             rollingBuffer.add(BufferData(copy, copiedInfo))
 
-                            // 60초의 영상만 보관하도록 수정
-                            val duration = rollingBuffer.last().bufferInfo.presentationTimeUs - rollingBuffer.first().bufferInfo.presentationTimeUs
-                            if (duration > 60_000_000){
-                                // 가장 처음의 key frame 찾기
-                                trimRollingBuffer()
-                            }
+                            trimSamples(rollingBuffer, info.presentationTimeUs)
                         }
                     } finally {
                         codec.releaseOutputBuffer(index, false)
@@ -296,31 +313,59 @@ class RecordingService : Service() {
         check(firstKeyFrame >= 0) { "저장할 키 프레임이 없습니다" }
         val baseTimeUs = rollingBuffer[firstKeyFrame].bufferInfo.presentationTimeUs
 
+        val endTimeUs = rollingBuffer.last().bufferInfo.presentationTimeUs
+        val audio = checkNotNull(audioRecorder)
+        val audioFormat = checkNotNull(audio.outputFormat) { "AAC 출력 포맷이 없습니다" }
+        val audioSamples = samplesInClip(audio.samples, baseTimeUs, endTimeUs) {
+            it.bufferInfo.presentationTimeUs
+        }
+        check(audioSamples.isNotEmpty()) { "영상 구간에 저장할 오디오 샘플이 없습니다" }
+
         val muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         try {
-            val trackIndex = muxer.addTrack(format)
+            // 두 트랙을 모두 추가한 다음 start해야 합니다.
+            val videoTrack = muxer.addTrack(format)
+            val audioTrack = muxer.addTrack(audioFormat)
             muxer.start()
-            for (index in firstKeyFrame until rollingBuffer.size) {
-                val sample = rollingBuffer[index]
-                val info = MediaCodec.BufferInfo().apply {
-                    set(
-                        0,
-                        sample.bufferInfo.size,
-                        sample.bufferInfo.presentationTimeUs - baseTimeUs,
-                        sample.bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM.inv()
-                    )
+            var videoIndex = firstKeyFrame
+            var audioIndex = 0
+            // 각 트랙의 순서를 유지하면서 PTS 순서로 기록합니다.
+            while (videoIndex < rollingBuffer.size || audioIndex < audioSamples.size) {
+                val video = rollingBuffer.getOrNull(videoIndex)
+                val sound = audioSamples.getOrNull(audioIndex)
+                if (video != null && (sound == null ||
+                        video.bufferInfo.presentationTimeUs <= sound.bufferInfo.presentationTimeUs)) {
+                    writeSample(muxer, videoTrack, video, baseTimeUs)
+                    videoIndex++
+                } else {
+                    writeSample(muxer, audioTrack, checkNotNull(sound), baseTimeUs)
+                    audioIndex++
                 }
-                val data = sample.buffer.duplicate()
-                data.position(0)
-                data.limit(info.size)
-                muxer.writeSampleData(trackIndex, data, info)
             }
             // stop()이 성공해야 MP4가 완성된 것으로 판단합니다.
             muxer.stop()
-            Log.d("RecordingService", "MP4 저장 완료: ${rollingBuffer.size - firstKeyFrame}개 샘플")
+            Log.d("RecordingService", "MP4 저장 완료: 영상 ${rollingBuffer.size - firstKeyFrame}개, " +
+                "오디오 ${audioSamples.size}개 샘플, 구간 ${(endTimeUs - baseTimeUs) / 1_000_000.0}초")
         } finally {
             muxer.release()
         }
+    }
+
+    private fun writeSample(
+        muxer: MediaMuxer,
+        track: Int,
+        sample: BufferData,
+        baseTimeUs: Long
+    ) {
+        val info = MediaCodec.BufferInfo().apply {
+            set(0, sample.bufferInfo.size,
+                sample.bufferInfo.presentationTimeUs - baseTimeUs,
+                sample.bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM.inv())
+        }
+        val data = sample.buffer.duplicate()
+        data.position(0)
+        data.limit(info.size)
+        muxer.writeSampleData(track, data, info)
     }
 
     private fun stopRecording() {
@@ -339,7 +384,9 @@ class RecordingService : Service() {
         serviceScope.launch {
             // 코덱 해제와 dequeueOutputBuffer가 동시에 실행되지 않도록 기다립니다.
             drainJob?.join()
+            audioJob?.join()
             drainJob = null
+            audioJob = null
             var savedSuccessfully = false
             try {
                 if (isRecording && !drainFailed) {
@@ -349,6 +396,12 @@ class RecordingService : Service() {
             } catch (e: Exception) {
                 Log.e("RecordingService", "MP4 저장 실패", e)
             } finally {
+                try {
+                    audioRecorder?.release()
+                } catch (e: Exception) {
+                    Log.e("RecordingService", "오디오 자원 해제 실패", e)
+                }
+                audioRecorder = null
                 try {
                     if (isRecording) mediaCodec?.stop()
                 } catch (e: Exception) {
@@ -427,6 +480,7 @@ class RecordingService : Service() {
                 Log.e("RecordingService", "Foreground 종료 실패", e)
             } finally {
                 stopSelf()
+                serviceScope.cancel()
             }
         }
     }
@@ -451,22 +505,4 @@ class RecordingService : Service() {
         ) ?: error("동영상 저장 위치 생성 실패")
     }
 
-    private fun trimRollingBuffer() {
-        if (rollingBuffer.isEmpty()) return
-
-        val latestTimeUs =
-            rollingBuffer.last().bufferInfo.presentationTimeUs
-
-        val cutoffTimeUs = latestTimeUs - 60_000_000L
-
-        // 최근 60초에 포함되는 첫 샘플을 찾습니다.
-        val keepFromIndex = rollingBuffer.indexOfFirst {
-            it.bufferInfo.presentationTimeUs >= cutoffTimeUs
-        }
-
-        // 그 앞의 오래된 샘플을 전부 삭제합니다.
-        if (keepFromIndex > 0) {
-            rollingBuffer.subList(0, keepFromIndex).clear()
-        }
-    }
 }
