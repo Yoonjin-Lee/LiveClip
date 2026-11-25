@@ -269,6 +269,13 @@ class RecordingService : Service() {
                                 set(0, info.size, info.presentationTimeUs, info.flags)
                             }
                             rollingBuffer.add(BufferData(copy, copiedInfo))
+
+                            // 60초의 영상만 보관하도록 수정
+                            val duration = rollingBuffer.last().bufferInfo.presentationTimeUs - rollingBuffer.first().bufferInfo.presentationTimeUs
+                            if (duration > 60_000_000){
+                                // 가장 처음의 key frame 찾기
+                                trimRollingBuffer()
+                            }
                         }
                     } finally {
                         codec.releaseOutputBuffer(index, false)
@@ -442,5 +449,24 @@ class RecordingService : Service() {
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
             values
         ) ?: error("동영상 저장 위치 생성 실패")
+    }
+
+    private fun trimRollingBuffer() {
+        if (rollingBuffer.isEmpty()) return
+
+        val latestTimeUs =
+            rollingBuffer.last().bufferInfo.presentationTimeUs
+
+        val cutoffTimeUs = latestTimeUs - 60_000_000L
+
+        // 최근 60초에 포함되는 첫 샘플을 찾습니다.
+        val keepFromIndex = rollingBuffer.indexOfFirst {
+            it.bufferInfo.presentationTimeUs >= cutoffTimeUs
+        }
+
+        // 그 앞의 오래된 샘플을 전부 삭제합니다.
+        if (keepFromIndex > 0) {
+            rollingBuffer.subList(0, keepFromIndex).clear()
+        }
     }
 }
